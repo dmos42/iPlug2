@@ -519,6 +519,18 @@ void IGraphicsNanoVG::BeginFrame()
 void IGraphicsNanoVG::EndFrame()
 {
   nvgEndFrame(mVG); // end main frame buffer update
+
+  if (mMainFrameBuffer == nullptr)
+  {
+    // DrawResize() could not build the off-screen surface, most often because the platform
+    // layer called in with no GL context current. Blitting a surface that does not exist is a
+    // null dereference: leave the window blank rather than take the host process down.
+    mInDraw = false;
+    ClearFBOStack();
+
+    return;
+  }
+
   nvgBindFramebuffer(nullptr);
   nvgBeginFrame(mVG, WindowWidth(), WindowHeight(), GetScreenScale());
   

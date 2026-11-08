@@ -108,6 +108,15 @@ private:
   bool ChooseVisual();
   void CreateGLContext();
   void DestroyGLContext();
+
+  /** Make this thread own the GL context, and say whether it succeeded: a false return means
+   * no GL call may be issued, because a call without a current context is dropped by the
+   * driver or crashes inside it, and a crash here would take the host down with it. */
+  bool TakeGLContext();
+  /** true when the window is mapped and holds a live GLX surface with a nonzero size. */
+  bool DrawableIsUsable();
+  /** Report a drawing problem at most once every two seconds. */
+  void WarnThrottled(const char* what);
   void DestroyWindow();
   void StopUIThread();
 
@@ -156,6 +165,9 @@ private:
   int mLastHeight = 0;
   bool mGLCurrent = false;
   bool mGLInitPending = false;
+  bool mResizePending = false;      // DrawResize() ran with no GL context: redo it once there is one
+  unsigned long long mNextResizeRetryMs = 0;
+  unsigned long long mLastWarnMs = 0;
 
   std::thread mUIThread;
   std::atomic<bool> mUIThreadRun { false };

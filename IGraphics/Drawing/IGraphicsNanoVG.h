@@ -106,6 +106,13 @@ public:
   void OnViewDestroyed() override;
   void DrawResize() override;
 
+  /** Whether DrawResize() built the off-screen surface a frame is drawn into. A platform
+   * layer asks this so it can skip drawing instead of walking into a null framebuffer. */
+  bool MainFramebufferIsReady() const
+  {
+    return mMainFrameBuffer != nullptr;
+  }
+
   void DrawBitmap(const IBitmap& bitmap, const IRECT& dest, int srcX, int srcY, const IBlend* pBlend) override;
 
   void DrawDottedLine(const IColor& color, float x1, float y1, float x2, float y2, const IBlend* pBlend, float thickness, float dashLen) override;

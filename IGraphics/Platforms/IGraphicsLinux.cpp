@@ -382,12 +382,81 @@ void IGraphicsLinux::DestroyGLContext()
 
 void IGraphicsLinux::ActivateGLContext()
 {
+  TakeGLContext();
+}
+
+bool IGraphicsLinux::TakeGLContext()
+{
   Display* dpy = static_cast<Display*>(mDisplay);
-  if (dpy && mGLXContext && mXWindow && !mGLCurrent)
+  if (!dpy || !mGLXContext || !mXWindow)
+    return false;
+
+  if (mGLCurrent)
+    return true;
+
+  if (!glXMakeCurrent(dpy, static_cast<GLXDrawable>(mXWindow), static_cast<GLXContext>(mGLXContext)))
   {
-    glXMakeCurrent(dpy, static_cast<GLXDrawable>(mXWindow), static_cast<GLXContext>(mGLXContext));
-    mGLCurrent = true;
+    // glXMakeCurrent says why in the X error handler below; here the only safe answer is to
+    // refuse the context. Issuing GL anyway means running against no context at all: the
+    // driver drops most calls, returns 0 from queries such as glCheckFramebufferStatus(), and
+    // a plug-in that goes on drawing then dies inside a driver stub and takes the host with it.
+    mGLCurrent = false;
+    WarnThrottled("glXMakeCurrent a echoue sur la fenetre de l'editeur");
+
+    return false;
   }
+
+  mGLCurrent = true;
+
+  return true;
+}
+
+bool IGraphicsLinux::DrawableIsUsable()
+{
+  Display* dpy = static_cast<Display*>(mDisplay);
+  if (!dpy || !mXWindow)
+    return false;
+
+  XWindowAttributes attr;
+  if (!XGetWindowAttributes(dpy, static_cast<Window>(mXWindow), &attr))
+    return false; // the window is gone: the error handler above already logged it
+
+  if (attr.map_state != IsViewable || attr.width <= 0 || attr.height <= 0)
+    return false;
+
+  unsigned int glxW = 0, glxH = 0;
+  glXQueryDrawable(dpy, static_cast<GLXDrawable>(mXWindow), GLX_WIDTH, &glxW);
+  glXQueryDrawable(dpy, static_cast<GLXDrawable>(mXWindow), GLX_HEIGHT, &glxH);
+
+  if (glxW == 0 || glxH == 0)
+  {
+    WarnThrottled("la surface GLX de l'editeur n'a plus de taille");
+
+    return false;
+  }
+
+  return true;
+}
+
+// Milliseconds on a monotonic clock, for the throttling below.
+static unsigned long long NowMs()
+{
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void IGraphicsLinux::WarnThrottled(const char* what)
+{
+  const unsigned long long now = NowMs();
+
+  if (mLastWarnMs && now - mLastWarnMs < 2000ULL)
+    return;
+
+  mLastWarnMs = now;
+
+  // stderr and not DBGMSG: a release build has to report this too, otherwise the window just
+  // stays blank and nothing says why.
+  fprintf(stderr, "IGraphicsLinux: %s (%dx%d, fenetre 0x%lx) : dessin suspendu, aucun appel OpenGL sans contexte\n", what,
+          PixelWidth(), PixelHeight(), mXWindow);
 }
 
 void IGraphicsLinux::DeactivateGLContext()
@@ -605,11 +674,32 @@ void IGraphicsLinux::PlatformResize(bool parentHasResized)
 
 void IGraphicsLinux::DrawResize()
 {
-  // Base class re-creates NanoVG's main framebuffer at the new size.
-  IGRAPHICS_DRAW_CLASS::DrawResize();
+  // The base class deletes NanoVG's main framebuffer and builds a new one for the new size,
+  // and those are GL calls: glGenTextures(), glCheckFramebufferStatus(). A resize reaches us
+  // as an X event on the window thread between two frames, where the context has been put
+  // away again, and without a context the driver drops the calls and the new framebuffer comes
+  // back null - the next EndFrame() would read a null pointer and the host would die.
+  const bool wasCurrent = mGLCurrent; // whether the context has to be put away again at the end
 
-  if (mGLCurrent)
+  if (!TakeGLContext())
+  {
+    mResizePending = true; // OnDisplayTimer() runs this again once a context is available
+
+    return;
+  }
+
+  IGRAPHICS_DRAW_CLASS::DrawResize();
+  mResizePending = !MainFramebufferIsReady();
+
+  if (!MainFramebufferIsReady())
+    WarnThrottled("la surface hors ecran de l'editeur n'a pas pu etre creee");
+  else
     glViewport(0, 0, static_cast<GLsizei>(PixelWidth()), static_cast<GLsizei>(PixelHeight()));
+
+  // Put the context away only if it was this resize that took it: UIRoop() keeps it current
+  // across the first layout, which loads control bitmaps into GL textures.
+  if (!wasCurrent)
+    DeactivateGLContext();
 }
 
 // MARK: - UI thread and event pump
@@ -769,11 +859,32 @@ void IGraphicsLinux::OnDisplayTimer()
   if (!dpy || !mXWindow || !mGLXContext)
     return;
 
+  if (!DrawableIsUsable())
+    return; // hidden, resized to nothing, or gone: there is no surface to draw into
+
+  if (mResizePending)
+  {
+    // A resize came while no GL context could be had: try the off-screen surface again on a
+    // slow clock instead of once per frame, and keep drawing off until it exists.
+    const unsigned long long now = NowMs();
+
+    if (now >= mNextResizeRetryMs)
+    {
+      mNextResizeRetryMs = now + 250ULL;
+      DrawResize();
+    }
+
+    if (mResizePending)
+      return;
+  }
+
   IRECTList rects;
   if (!IsDirty(rects))
     return;
 
-  ActivateGLContext();
+  if (!TakeGLContext())
+    return;
+
   Draw(rects);
   CaptureFrameIfNeeded();
   glXSwapBuffers(dpy, static_cast<GLXDrawable>(mXWindow));
