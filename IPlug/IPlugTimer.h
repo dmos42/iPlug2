@@ -31,6 +31,9 @@
 #include <CoreFoundation/CoreFoundation.h>
 #elif defined OS_WEB
 #include <emscripten/html5.h>
+#elif defined OS_LINUX
+#include <memory>
+#include <thread>
 #endif
 
 BEGIN_IPLUG_NAMESPACE
@@ -94,6 +97,26 @@ public:
 private:
   long ID = 0;
   ITimerFunction mTimerFunc;
+};
+#elif defined OS_LINUX
+class Timer_impl : public Timer
+{
+public:
+  Timer_impl(ITimerFunction func, uint32_t intervalMs);
+  ~Timer_impl() override;
+  void Stop() override;
+
+  /** The other platforms deliver the tick on the thread that owns the window, and the
+   * plug-in relies on that (OnTimer pushes data into the editor). Linux has no message
+   * queue in this layer, so the window implementation registers a dispatcher here and
+   * every tick runs inside it. With no dispatcher - no editor open - the tick runs on
+   * the timer thread. */
+  static void SetThreadDispatcher(std::function<void(std::function<void()>)> dispatcher);
+
+private:
+  struct State;
+  std::shared_ptr<State> mState;
+  std::thread mThread;
 };
 #else
   #error NOT IMPLEMENTED

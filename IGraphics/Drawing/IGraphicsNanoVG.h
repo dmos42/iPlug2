@@ -13,6 +13,17 @@
 #include "IPlugPlatform.h"
 #include "IGraphics.h"
 
+#if defined OS_LINUX && defined IGRAPHICS_GL
+  // IGraphics_select.h only pulls in the GL headers for TUs that include it, and this
+  // header is also used on its own (IGraphicsNanoVG.cpp), so ask for the system GL and
+  // extension prototypes here too: the GL2 backend below calls FBO/blend entry points.
+  #ifndef GL_GLEXT_PROTOTYPES
+    #define GL_GLEXT_PROTOTYPES
+  #endif
+  #include <GL/gl.h>
+  #include <GL/glext.h>
+#endif
+
 #include "nanovg.h"
 #include "mutex.h"
 #include <stack>

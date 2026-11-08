@@ -42,6 +42,8 @@
     #elif defined IGRAPHICS_GL3
       #include <OpenGL/gl3.h>
     #endif
+  #elif defined OS_LINUX
+    // nothing to include: IGraphicsLinux.h below pulls in the system <GL/gl.h> via IGraphics_select.h
   #else
     #include <OpenGL/gl.h>
   #endif

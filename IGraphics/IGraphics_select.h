@@ -33,6 +33,16 @@
     #define IGRAPHICS_GL
     #if defined OS_WIN
       #include <glad/glad.h>
+    #elif defined OS_LINUX
+      // Linux/GLX: libGL already exports the GL 1.2-2.1 entry points, and the X11/GLX
+      // code in the Linux platform layer needs the system <GL/gl.h> types (glXChooseFBConfig
+      // takes them), so no glad loader here. GL_GLEXT_PROTOTYPES gives prototypes for the
+      // GL 2.x entry points NanoVG calls (glBlendFuncSeparate, FBOs, ...).
+      #ifndef GL_GLEXT_PROTOTYPES
+        #define GL_GLEXT_PROTOTYPES
+      #endif
+      #include <GL/gl.h>
+      #include <GL/glext.h>
     #elif defined OS_MAC
       #if defined IGRAPHICS_GL2
         #include <OpenGL/gl.h>

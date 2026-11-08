@@ -23,6 +23,11 @@
 #include <windows.h>
 #include <Shlobj.h>
 #include <Shlwapi.h>
+#elif defined OS_LINUX
+#include <dlfcn.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 BEGIN_IPLUG_NAMESPACE
@@ -169,7 +174,7 @@ EResourceLocation LocateResource(const char* name, const char* type, WDL_String&
       }
     }
   }
-  return EResourceLocation::kNotFound;
+return EResourceLocation::kNotFound;
 }
 
 const void* LoadWinResource(const char* resid, const char* type, int& sizeInBytes, void* pHInstance)
@@ -254,6 +259,306 @@ EResourceLocation LocateResource(const char* name, const char* type, WDL_String&
     }
   }
   return EResourceLocation::kNotFound;
+}
+
+#elif defined OS_LINUX
+#pragma mark - OS_LINUX
+
+static bool PathExists(const char* path)
+{
+  struct stat st;
+  return path && *path && stat(path, &st) == 0;
+}
+
+static bool IsADirectory(const char* path)
+{
+  struct stat st;
+  return path && *path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/** Append a path part, keeping exactly one separator. */
+static void AppendPathPart(WDL_String& path, const char* part)
+{
+  if (!part || !*part)
+    return;
+
+  if (!path.GetLength())
+  {
+    path.Set(part);
+    return;
+  }
+
+  const int len = path.GetLength();
+
+  if (path.Get()[len - 1] == '/')
+    path.Append(part);
+  else if (*part == '/')
+    path.Append(part);
+  else
+  {
+    path.Append("/");
+    path.Append(part);
+  }
+}
+
+/** Drop the file name from a full path, keeping the folder and its trailing slash. */
+static void StripFileName(WDL_String& path)
+{
+  const char* file = path.get_filepart();
+
+  if (!file)
+    return;
+
+  if (file == path.Get()) // no folder part at all
+    path.Set("./");
+  else
+    path.SetLen(static_cast<int>(file - path.Get()));
+}
+
+static void EnvOrHome(WDL_String& path, const char* envVar, const char* homeRelative)
+{
+  const char* env = getenv(envVar);
+
+  if (env && *env)
+  {
+    path.Set(env);
+    return;
+  }
+
+  UserHomePath(path);
+  AppendPathPart(path, homeRelative);
+}
+
+void HostPath(WDL_String& path, const char*)
+{
+  char buf[PATH_MAX];
+  const ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+
+  if (len > 0)
+  {
+    buf[len] = '\0';
+    path.Set(buf);
+  }
+  else
+    path.Set("");
+}
+
+/** Resolve the file a running piece of code was loaded from: the plug-in module when
+ * pExtra is a pointer inside it, otherwise the current process executable. */
+static void GetModulePath(void* pExtra, WDL_String& path)
+{
+  Dl_info info;
+
+  if (pExtra && dladdr(pExtra, &info) && info.dli_fname && *info.dli_fname)
+    path.Set(info.dli_fname);
+  else if (dladdr((void*) &GetModulePath, &info) && info.dli_fname && *info.dli_fname)
+    path.Set(info.dli_fname);
+  else
+    HostPath(path, nullptr);
+}
+
+void PluginPath(WDL_String& path, PluginIDType pExtra)
+{
+  GetModulePath(pExtra, path);
+}
+
+/** Inside a VST3 bundle on Linux the module lives at
+ * Bundle.vst3/Contents/<arch>/module.so, and shared resources sit in
+ * Bundle.vst3/Contents/Resources, which matches the Windows layout. */
+void BundleResourcePath(WDL_String& path, PluginIDType pExtra)
+{
+  GetModulePath(pExtra, path);
+
+  if (!path.GetLength())
+    return;
+
+  const char* contents = strstr(path.Get(), "/Contents/");
+
+  if (contents)
+  {
+    path.SetLen(static_cast<int>(contents - path.Get()) + strlen("/Contents/"));
+    path.Append("Resources/");
+    return;
+  }
+
+  // Standalone or loose build: resources beside the module.
+  StripFileName(path);
+  AppendPathPart(path, "Resources/");
+}
+
+void DesktopPath(WDL_String& path)
+{
+  const char* xdg = getenv("XDG_DESKTOP_DIR");
+
+  if (xdg && *xdg)
+    path.Set(xdg);
+  else
+  {
+    UserHomePath(path);
+    AppendPathPart(path, "Desktop");
+
+    if (!IsADirectory(path.Get()))
+      UserHomePath(path);
+  }
+}
+
+void UserHomePath(WDL_String& path)
+{
+  const char* home = getenv("HOME");
+  path.Set((home && *home) ? home : "/");
+}
+
+void AppSupportPath(WDL_String& path, bool isSystem)
+{
+  if (isSystem)
+    path.Set("/usr/local/share");
+  else
+    EnvOrHome(path, "XDG_DATA_HOME", ".local/share");
+}
+
+void VST3PresetsPath(WDL_String& path, const char* mfrName, const char* pluginName, bool isSystem)
+{
+  if (isSystem)
+    path.Set("/usr/local/share/vst3-presets");
+  else
+    EnvOrHome(path, "XDG_DATA_HOME", ".local/share");
+
+  AppendPathPart(path, "VST3 Presets");
+  AppendPathPart(path, mfrName);
+  AppendPathPart(path, pluginName);
+}
+
+void INIPath(WDL_String& path, const char* pluginName)
+{
+  EnvOrHome(path, "XDG_CONFIG_HOME", ".config");
+  AppendPathPart(path, pluginName);
+}
+
+void WebViewCachePath(WDL_String& path)
+{
+  EnvOrHome(path, "XDG_CACHE_HOME", ".cache");
+  AppendPathPart(path, "iPlug2/WebViewCache");
+}
+
+/** Look for a file in the usual places: as an absolute path, next to the module, in the
+ * bundle's Resources folders, then in the XDG data directories. */
+EResourceLocation LocateResource(const char* name, const char* type, WDL_String& result, const char*, void* pHInstance,
+                                 const char* sharedResourcesSubPath)
+{
+  if (!CStringHasContents(name))
+    return EResourceLocation::kNotFound;
+
+  if (PathExists(name))
+  {
+    result.Set(name);
+    return EResourceLocation::kAbsolutePath;
+  }
+
+  WDL_String modulePath;
+  GetModulePath(pHInstance, modulePath);
+  StripFileName(modulePath);
+
+  WDL_String bundleResources;
+  BundleResourcePath(bundleResources, pHInstance);
+
+  WDL_String candidate;
+
+  auto tryPath = [&](const WDL_String& dir) -> bool {
+    candidate.Set(dir.Get());
+    AppendPathPart(candidate, name);
+
+    if (PathExists(candidate.Get()))
+    {
+      result.Set(candidate.Get());
+      return true;
+    }
+    return false;
+  };
+
+  WDL_String dir(bundleResources);
+
+  if (sharedResourcesSubPath && *sharedResourcesSubPath)
+  {
+    WDL_String sub(dir);
+    AppendPathPart(sub, sharedResourcesSubPath);
+    if (tryPath(sub))
+      return EResourceLocation::kAbsolutePath;
+  }
+
+  if (tryPath(dir))
+    return EResourceLocation::kAbsolutePath;
+
+  // The mac layout puts images and fonts in Resources subfolders.
+  {
+    WDL_String sub(dir);
+    const char* file = name;
+    const char* filePart = nullptr;
+    WDL_String tmp(name);
+    filePart = tmp.get_filepart();
+
+    if (filePart && *filePart)
+    {
+      auto sameExt = [](const char* a, const char* b) {
+        while (*a && *b)
+        {
+          if (tolower(static_cast<unsigned char>(*a)) != tolower(static_cast<unsigned char>(*b)))
+            return false;
+          ++a;
+          ++b;
+        }
+        return *a == *b;
+      };
+
+      // The image extension is whatever the caller passed - "png", "jpg", "svg" - and fonts use
+      // the same Resources subfolders, so key the subfolder off the extension, not one name.
+      if (sameExt(type, "png") || sameExt(type, "jpg") || sameExt(type, "jpeg") || sameExt(type, "svg") ||
+          sameExt(type, "ktx"))
+        AppendPathPart(sub, "img");
+      else if (sameExt(type, "ttf") || sameExt(type, "otf") || sameExt(type, "woff") || sameExt(type, "woff2"))
+        AppendPathPart(sub, "fonts");
+
+      candidate.Set(sub.Get());
+      AppendPathPart(candidate, filePart);
+
+      if (PathExists(candidate.Get()))
+      {
+        result.Set(candidate.Get());
+        return EResourceLocation::kAbsolutePath;
+      }
+    }
+  }
+
+  if (tryPath(modulePath))
+    return EResourceLocation::kAbsolutePath;
+
+  {
+    WDL_String sub(modulePath);
+    AppendPathPart(sub, "Resources");
+    if (tryPath(sub))
+      return EResourceLocation::kAbsolutePath;
+  }
+
+  {
+    WDL_String appSupport;
+    AppSupportPath(appSupport, false);
+    if (tryPath(appSupport))
+      return EResourceLocation::kAbsolutePath;
+  }
+
+  {
+    WDL_String sys;
+    AppSupportPath(sys, true);
+    if (tryPath(sys))
+      return EResourceLocation::kAbsolutePath;
+  }
+
+  return EResourceLocation::kNotFound;
+}
+
+const void* LoadWinResource(const char*, const char*, int& sizeInBytes, void*)
+{
+  sizeInBytes = 0;
+  return nullptr;
 }
 
 #endif
