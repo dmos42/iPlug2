@@ -127,7 +127,10 @@ BEGIN_IPLUG_NAMESPACE
     tm* pT = localtime(&t);
     
     char cStr[32];
-    strftime(cStr, 32, "%Y%m%d %H:%M ", pT);
+    // strftime returns 0 when the buffer does not fit, and leaves the buffer
+    // untouched: strlen below would then read uninitialized memory.
+    if (strftime(cStr, sizeof(cStr), "%Y%m%d %H:%M ", pT) == 0)
+      cStr[0] = '\0';
     
     int tz = 60 * pT->tm_hour + pT->tm_min;
     int yday = pT->tm_yday;
@@ -141,9 +144,17 @@ BEGIN_IPLUG_NAMESPACE
       tz += 24 * 60 * yday;
     }
     int i = (int) strlen(cStr);
-    cStr[i++] = tz >= 0 ? '+' : '-';
-    if (tz < 0) tz = -tz;
-    snprintf(&cStr[i], 32, "%02d%02d", tz / 60, tz % 60);
+    // The sign, four digits and the terminator still have to fit in what is
+    // left of cStr. The old snprintf call passed 32 as the size even though
+    // &cStr[i] only has sizeof(cStr) - i bytes behind it, which is a buffer
+    // overflow as far as glibc _FORTIFY_SOURCE is concerned: the process is
+    // aborted before anything is written.
+    if (i + 5 < static_cast<int>(sizeof(cStr)))
+    {
+      cStr[i++] = tz >= 0 ? '+' : '-';
+      if (tz < 0) tz = -tz;
+      snprintf(&cStr[i], sizeof(cStr) - i, "%02d%02d", tz / 60, tz % 60);
+    }
     
     static char sTimeStr[32];
     strcpy(sTimeStr, cStr);
