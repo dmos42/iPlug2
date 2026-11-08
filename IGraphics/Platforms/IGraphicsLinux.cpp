@@ -29,6 +29,10 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
+#ifdef VOLUM_HAVE_PORTAL
+#include "IGraphicsLinuxPortal.h"
+#endif
+
 #include "IPopupMenuControl.h"
 #include "IPlugTimer.h"
 
@@ -589,6 +593,25 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
     hints.flags = PSize | PMinSize;
     hints.min_width = hints.min_height = 1;
     XSetWMNormalHints(dpy, static_cast<Window>(mXWindow), &hints);
+
+    // Who owns this window. The XDG desktop portal is told "put your dialog against
+    // window 0x…" and answers it by looking the window up on the X server, where the
+    // only two properties that connect a window to a process are these. Without
+    // them a chooser opens, but on its own rather than as a child of the editor: it
+    // does not raise with it, and does not go away with it.
+    static Atom xaNetWmPid = XInternAtom(dpy, "_NET_WM_PID", False);
+    static Atom xaWmClientMachine = XInternAtom(dpy, "WM_CLIENT_MACHINE", False);
+
+    const long pid = static_cast<long>(getpid());
+    XChangeProperty(dpy, static_cast<Window>(mXWindow), xaNetWmPid, XA_CARDINAL, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&pid), 1);
+
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) == 0)
+    {
+      hostname[sizeof(hostname) - 1] = '\0';
+      XChangeProperty(dpy, static_cast<Window>(mXWindow), xaWmClientMachine, XA_STRING, 8, PropModeReplace, reinterpret_cast<const unsigned char*>(hostname),
+                      static_cast<int>(strlen(hostname)));
+    }
   }
 
   // Input method, so non-ASCII typing works and the IM preedit stays out of our way.
@@ -1331,43 +1354,252 @@ EMsgBoxResult IGraphicsLinux::ShowMessageBox(const char* str, const char* captio
   return result;
 }
 
+#ifdef VOLUM_HAVE_PORTAL
+
+namespace
+{
+
+/** iPlug's extension list to the portal's type menu lives with the portal client,
+ *  so the translation is the one the scripted test drives (see test/portal-test.bash).
+ */
+
+/** Everything up to and including the last slash, or "" when there is none. */
+std::string folderOf(const std::string& path)
+{
+  const size_t slash = path.find_last_of('/');
+  return slash == std::string::npos ? std::string() : path.substr(0, slash + 1);
+}
+
+/** The last component of a path. */
+std::string nameOf(const std::string& path)
+{
+  const size_t slash = path.find_last_of('/');
+  return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+/** "x11:0x…" for the desktop to place its dialog against - only our own top-level
+ *  window. An editor embedded in a host is not ours to name, and the host's window
+ *  is not ours to hand over either, so an embedded editor lets the desktop place
+ *  the dialog where it likes. */
+std::string portalParentWindow(unsigned long window, bool embedded)
+{
+  if (!window || embedded)
+    return std::string();
+
+  char id[32];
+  std::snprintf(id, sizeof(id), "x11:0x%lx", window);
+  return std::string(id);
+}
+
+/** The request, then the desktop's answer - with one retry. Some portals refuse a
+ *  whole request over a parent window they cannot make sense of, and losing the
+ *  dialog altogether is worse than losing the link between the two windows. */
+EPortalResult askDesktop(PortalFileRequest& request, std::vector<std::string>& pathsOut, std::string& errorOut, const char* who)
+{
+  EPortalResult result = PortalChooseFiles(request, pathsOut, errorOut);
+
+  if (result == EPortalResult::Failed && !request.mParentWindow.empty())
+  {
+    DBGMSG("IGraphicsLinux::%s: the desktop refused the dialog (%s); asking again without a parent window\n", who, errorOut.c_str());
+    request.mParentWindow.clear();
+    result = PortalChooseFiles(request, pathsOut, errorOut);
+  }
+
+  return result;
+}
+
+} // namespace
+
+#endif
+
 void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path, EFileAction action, const char* ext,
                                    IFileDialogCompletionHandlerFunc completionHandler)
 {
-  // TODO(linux): org.freedesktop.portal.FileChooser over D-Bus (works on Wayland and
-  // X11, no toolkit dependency in-process). Cancelling reports empty strings.
-  DBGMSG("IGraphicsLinux::PromptForFile is not implemented on Linux yet (%s, ext '%s')\n",
-          action == EFileAction::Save ? "save" : "open", ext ? ext : "");
+#ifdef VOLUM_HAVE_PORTAL
+  const bool save = action == EFileAction::Save;
+
+  PortalFileRequest request;
+  request.mMethod = save ? "SaveFile" : "OpenFile";
+  request.mTitle = save ? "Save" : "Open";
+  request.mParentWindow = portalParentWindow(mXWindow, mEmbedded);
+  request.mFilters = PortalFiltersFromExtensions(ext);
+
+  // iPlug spells the same thing two ways: the Windows back end is handed a whole
+  // path in fileName and a folder in path, the Cocoa one a bare name and a folder.
+  // Take whichever of the two carries a folder, and keep the name whole.
+  std::string givenPath(path.Get() ? path.Get() : "");
+  std::string givenName(fileName.GetLength() ? fileName.Get() : "");
+
+  if (!givenName.empty() && givenName.find('/') != std::string::npos)
+  {
+    if (givenPath.empty())
+      givenPath = folderOf(givenName);
+    givenName = nameOf(givenName);
+  }
+
+  while (!givenPath.empty() && givenPath.back() == '/')
+    givenPath.pop_back(); // the portal wants a folder, not a folder with a slash
+
+  request.mInitialPath = givenPath;
+  request.mInitialName = save ? givenName : std::string();
+
+  std::vector<std::string> picked;
+  std::string error;
+  const EPortalResult result = askDesktop(request, picked, error, "PromptForFile");
+
+  if (result != EPortalResult::Chosen || picked.empty())
+  {
+    if (result == EPortalResult::Failed)
+      DBGMSG("IGraphicsLinux::PromptForFile: %s\n", error.c_str());
+
+    fileName.Set("");
+    path.Set("");
+
+    if (completionHandler)
+      completionHandler(fileName, path);
+    return;
+  }
+
+  // Both come back the way Windows reports them - the whole path in fileName, its
+  // folder with a trailing separator in path - because the plug-in code that reads
+  // them is the Windows code, and it opens the path it is given.
+  fileName.Set(picked.front().c_str());
+  path.Set(folderOf(picked.front()).c_str());
+
+  if (completionHandler)
+    completionHandler(fileName, path);
+#else
+  DBGMSG("IGraphicsLinux::PromptForFile: no portal in this build, so no dialog (%s, ext '%s')\n", save ? "save" : "open", ext ? ext : "");
 
   fileName.Set("");
   path.Set("");
 
   if (completionHandler)
     completionHandler(fileName, path);
+#endif
 }
 
 void IGraphicsLinux::PromptForFiles(WDL_String& path, std::vector<WDL_String>& fileNames, const char* ext)
 {
-  DBGMSG("IGraphicsLinux::PromptForFiles is not implemented on Linux yet (ext '%s')\n", ext ? ext : "");
+#ifdef VOLUM_HAVE_PORTAL
+  PortalFileRequest request;
+  request.mTitle = "Open";
+  request.mParentWindow = portalParentWindow(mXWindow, mEmbedded);
+  request.mFilters = PortalFiltersFromExtensions(ext);
+  request.mMultiple = true;
+
+  std::string folder(path.Get() ? path.Get() : "");
+  while (!folder.empty() && folder.back() == '/')
+    folder.pop_back();
+  request.mInitialPath = folder;
+
+  std::vector<std::string> picked;
+  std::string error;
+  const EPortalResult result = askDesktop(request, picked, error, "PromptForFiles");
+
+  fileNames.clear();
+
+  if (result != EPortalResult::Chosen || picked.empty())
+  {
+    if (result == EPortalResult::Failed)
+      DBGMSG("IGraphicsLinux::PromptForFiles: %s\n", error.c_str());
+
+    path.Set("");
+    return;
+  }
+
+  // As IGraphics.h documents it: every entry a full path. The folder is reported
+  // from the first of them, which is what the caller uses as its "last place we
+  // were" hint for the next time.
+  for (const std::string& file : picked)
+    fileNames.emplace_back(file.c_str());
+
+  path.Set(folderOf(picked.front()).c_str());
+#else
+  DBGMSG("IGraphicsLinux::PromptForFiles: no portal in this build, so no dialog (ext '%s')\n", ext ? ext : "");
 
   path.Set("");
   fileNames.clear();
+#endif
 }
 
 void IGraphicsLinux::PromptForDirectory(WDL_String& dir, IFileDialogCompletionHandlerFunc completionHandler)
 {
-  DBGMSG("IGraphicsLinux::PromptForDirectory is not implemented on Linux yet\n");
+#ifdef VOLUM_HAVE_PORTAL
+  PortalFileRequest request;
+  request.mTitle = "Choose a folder";
+  request.mParentWindow = portalParentWindow(mXWindow, mEmbedded);
+  request.mDirectory = true; // the option arrived in portal version 3; older desktops ignore it and offer files
+
+  std::string folder(dir.Get() ? dir.Get() : "");
+  while (!folder.empty() && folder.back() == '/')
+    folder.pop_back();
+  request.mInitialPath = folder;
+
+  std::vector<std::string> picked;
+  std::string error;
+  const EPortalResult result = askDesktop(request, picked, error, "PromptForDirectory");
+
+  if (result != EPortalResult::Chosen || picked.empty())
+  {
+    if (result == EPortalResult::Failed)
+      DBGMSG("IGraphicsLinux::PromptForDirectory: %s\n", error.c_str());
+
+    dir.Set("");
+
+    if (completionHandler)
+      completionHandler(dir, dir);
+    return;
+  }
+
+  dir.Set(picked.front().c_str());
+
+  if (completionHandler)
+    completionHandler(dir, dir);
+#else
+  DBGMSG("IGraphicsLinux::PromptForDirectory: no portal in this build, so no dialog\n");
 
   dir.Set("");
 
   if (completionHandler)
     completionHandler(dir, dir);
+#endif
 }
 
 bool IGraphicsLinux::PromptForColor(IColor& color, const char* str, IColorPickerHandlerFunc func)
 {
-  DBGMSG("IGraphicsLinux::PromptForColor is not implemented on Linux yet (%s)\n", str ? str : "");
+#ifdef VOLUM_HAVE_PORTAL
+  double rgb[3] = {0.0, 0.0, 0.0};
+  std::string error;
+  std::string parent = portalParentWindow(mXWindow, mEmbedded);
+  const char* title = str && *str ? str : "Choose a color";
+
+  EPortalResult result = PortalPickColor(rgb, parent.c_str(), title, error);
+  if (result == EPortalResult::Failed && !parent.empty())
+  {
+    DBGMSG("IGraphicsLinux::PromptForColor: the desktop refused the dialog (%s); asking again without a parent window\n", error.c_str());
+    parent.clear();
+    result = PortalPickColor(rgb, parent.c_str(), title, error);
+  }
+
+  if (result != EPortalResult::Chosen)
+  {
+    DBGMSG("IGraphicsLinux::PromptForColor: %s\n", error.empty() ? "the colour prompt was cancelled" : error.c_str());
+    return false;
+  }
+
+  // The portal has no alpha, so the colour keeps the one the control had.
+  color.Set(color.A, static_cast<int>(rgb[0] * 255.0 + 0.5), static_cast<int>(rgb[1] * 255.0 + 0.5), static_cast<int>(rgb[2] * 255.0 + 0.5));
+  color.Clamp();
+
+  if (func)
+    func(color);
+
+  return true;
+#else
+  DBGMSG("IGraphicsLinux::PromptForColor: no portal in this build, so no dialog (%s)\n", str ? str : "");
   return false;
+#endif
 }
 
 bool IGraphicsLinux::OpenURL(const char* url, const char* msgWindowTitle, const char* confirmMsg, const char* errMsgOnFailure)
