@@ -844,6 +844,17 @@ void IGraphicsLinux::UIRoop()
     DeactivateGLContext();
   }
 
+  // Tell the plug-in its editor is open - the call IGraphicsWin makes at the end of
+  // OpenWindow, and which nothing else in iPlug2 does. It can only run here on Linux:
+  // OnUIOpen pushes every parameter through OnParamChangeUI, which walks the control
+  // tree, and that tree is only laid out a few lines above, on this thread. Called any
+  // earlier it dereferences controls that do not exist yet - an attempt at the end of
+  // OpenWindow core dumped exactly there, in NeuralAmpModeler::OnParamChangeUI.
+  // Skipping it altogether is quieter but just as wrong: the plug-in's editor-open flag
+  // stays false, its ProcessBlock then steps over its own meter work, and the IN and OUT
+  // bars sit at zero in a window that otherwise draws, clicks and loads amps normally.
+  GetDelegate()->OnUIOpen();
+
   if (dpy)
     XUnlockDisplay(dpy);
 
