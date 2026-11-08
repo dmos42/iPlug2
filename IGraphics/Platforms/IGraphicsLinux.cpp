@@ -1377,18 +1377,67 @@ std::string nameOf(const std::string& path)
   return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
-/** "x11:0x…" for the desktop to place its dialog against - only our own top-level
- *  window. An editor embedded in a host is not ours to name, and the host's window
- *  is not ours to hand over either, so an embedded editor lets the desktop place
- *  the dialog where it likes. */
-std::string portalParentWindow(unsigned long window, bool embedded)
+/** Whether this window says it belongs to this process. _NET_WM_PID is the only
+ *  property on an X11 window that says so, and a window that does not carry it says
+ *  nothing either way, which is why the climb below stops at the first that does. */
+bool windowIsOurs(Display* dpy, ::Window window, Atom property, unsigned long ourPid)
 {
-  if (!window || embedded)
+  Atom type = None;
+  int format = 0;
+  unsigned long items = 0, bytesLeft = 0;
+  unsigned char* data = nullptr;
+
+  if (XGetWindowProperty(dpy, window, property, 0, 1, False, XA_CARDINAL, &type, &format, &items, &bytesLeft, &data) != Success || !data)
+    return false;
+
+  const bool ours = format == 32 && items >= 1 && *reinterpret_cast<unsigned long*>(data) == ourPid;
+  XFree(data);
+
+  return ours;
+}
+
+/** "x11:0x…" for the desktop to place its dialog against. Our own window is seldom
+ *  the one the desktop knows: an editor embedded in a host is a child of the host's
+ *  window, and the standalone's editor is a child of the window the host made for
+ *  it. So climb the tree until an ancestor claims this process as its own and hand
+ *  that window over - it is our process either way, a plug-in runs inside its host,
+ *  and that is exactly why the dialog lands in front of the window the user is
+ *  looking at and goes away with it. */
+std::string portalParentWindow(Display* dpy, unsigned long window)
+{
+  if (!dpy || !window)
     return std::string();
 
-  char id[32];
-  std::snprintf(id, sizeof(id), "x11:0x%lx", window);
-  return std::string(id);
+  const unsigned long ourPid = static_cast<unsigned long>(getpid());
+  const Atom xaNetWmPid = XInternAtom(dpy, "_NET_WM_PID", False);
+  ::Window current = static_cast<::Window>(window);
+
+  for (int depth = 0; depth < 8 && current; ++depth)
+  {
+    if (windowIsOurs(dpy, current, xaNetWmPid, ourPid))
+    {
+      char id[32];
+      std::snprintf(id, sizeof(id), "x11:0x%lx", static_cast<unsigned long>(current));
+      return std::string(id);
+    }
+
+    ::Window root = 0, parent = 0;
+    ::Window* children = nullptr;
+    unsigned int nChildren = 0;
+
+    if (XQueryTree(dpy, current, &root, &parent, &children, &nChildren) == 0)
+      break;
+
+    if (children)
+      XFree(children);
+
+    if (!parent || parent == root || parent == current)
+      break; // nothing of ours above the root, and a window cannot be its own parent
+
+    current = parent;
+  }
+
+  return std::string();
 }
 
 /** The request, then the desktop's answer - with one retry. Some portals refuse a
@@ -1421,7 +1470,7 @@ void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path, EFile
   PortalFileRequest request;
   request.mMethod = save ? "SaveFile" : "OpenFile";
   request.mTitle = save ? "Save" : "Open";
-  request.mParentWindow = portalParentWindow(mXWindow, mEmbedded);
+  request.mParentWindow = portalParentWindow(static_cast<Display*>(mDisplay), mXWindow);
   request.mFilters = PortalFiltersFromExtensions(ext);
 
   // iPlug spells the same thing two ways: the Windows back end is handed a whole
@@ -1484,7 +1533,7 @@ void IGraphicsLinux::PromptForFiles(WDL_String& path, std::vector<WDL_String>& f
 #ifdef VOLUM_HAVE_PORTAL
   PortalFileRequest request;
   request.mTitle = "Open";
-  request.mParentWindow = portalParentWindow(mXWindow, mEmbedded);
+  request.mParentWindow = portalParentWindow(static_cast<Display*>(mDisplay), mXWindow);
   request.mFilters = PortalFiltersFromExtensions(ext);
   request.mMultiple = true;
 
@@ -1528,7 +1577,7 @@ void IGraphicsLinux::PromptForDirectory(WDL_String& dir, IFileDialogCompletionHa
 #ifdef VOLUM_HAVE_PORTAL
   PortalFileRequest request;
   request.mTitle = "Choose a folder";
-  request.mParentWindow = portalParentWindow(mXWindow, mEmbedded);
+  request.mParentWindow = portalParentWindow(static_cast<Display*>(mDisplay), mXWindow);
   request.mDirectory = true; // the option arrived in portal version 3; older desktops ignore it and offer files
 
   std::string folder(dir.Get() ? dir.Get() : "");
@@ -1571,7 +1620,7 @@ bool IGraphicsLinux::PromptForColor(IColor& color, const char* str, IColorPicker
 #ifdef VOLUM_HAVE_PORTAL
   double rgb[3] = {0.0, 0.0, 0.0};
   std::string error;
-  std::string parent = portalParentWindow(mXWindow, mEmbedded);
+  std::string parent = portalParentWindow(static_cast<Display*>(mDisplay), mXWindow);
   const char* title = str && *str ? str : "Choose a color";
 
   EPortalResult result = PortalPickColor(rgb, parent.c_str(), title, error);
