@@ -43,6 +43,8 @@
 BEGIN_IPLUG_NAMESPACE
 BEGIN_IGRAPHICS_NAMESPACE
 
+class LinuxMessageBoxControl;
+
 /** IGraphics platform class for Linux (X11 / XWayland + GLX).
  * @ingroup PlatformClasses */
 class IGraphicsLinux final : public IGRAPHICS_DRAW_CLASS
@@ -52,6 +54,12 @@ public:
   ~IGraphicsLinux() override;
 
   // MARK: window lifecycle
+  /** Hide the in-app message box, if one is up: with the window gone there is nothing to
+   * draw it into, and a stale box would reappear over the next editor. */
+  void HideMessageBox();
+  /** Headless-harness hook (the same spirit as VOLUM_LINUX_CAPTURE): the rect of the
+   * message box's index-th button, 0 = leftmost, empty while no box is drawn. */
+  IRECT GetMessageBoxButtonRect(int index) const;
   void* OpenWindow(void* pParent) override;
   void CloseWindow() override;
   bool WindowIsOpen() override { return mXWindow != 0; }
@@ -193,6 +201,10 @@ private:
   int mLastClickButton = 0;
   int mLastClickX = 0;
   int mLastClickY = 0;
+
+  // The in-app message box, attached to the control stack on first use and kept for the
+  // lifetime of the graphics context. Owned by IGraphics once attached.
+  LinuxMessageBoxControl* mMessageBoxControl = nullptr;
 
   // CLIPBOARD ownership + the scratch window used when we request the selection.
   std::string mClipText;

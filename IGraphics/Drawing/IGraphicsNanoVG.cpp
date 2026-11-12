@@ -635,7 +635,16 @@ void IGraphicsNanoVG::PrepareAndMeasureText(const IText& text, const char* str, 
 {
   float fbounds[4];
   
-  assert(nvgFindFont(mVG, text.mFont) != -1 && "No font found - did you forget to load it?");
+  const int fontIdx = nvgFindFont(mVG, text.mFont);
+  assert(fontIdx != -1 && "No font found - did you forget to load it?");
+  
+  if (fontIdx == -1) // NDEBUG builds run on: measure nothing rather than hand back uninitialized stack
+  {
+    r = IRECT();
+    x = 0.;
+    y = 0.;
+    return;
+  }
   
   nvgFontBlur(mVG, 0);
   nvgFontSize(mVG, text.mSize);

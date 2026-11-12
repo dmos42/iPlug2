@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -673,6 +674,8 @@ void IGraphicsLinux::CloseWindow()
 
   if (!mXWindow)
     return;
+
+  HideMessageBox();
 
   StopUIThread();
   OnViewDestroyed();
@@ -1350,11 +1353,360 @@ void IGraphicsLinux::ForceEndUserEdit()
 
 // MARK: - Dialogs and URL launching
 
+/** The message box ShowMessageBox draws when there is no native one to ask for: a dimmed
+ * canvas, a panel with the caption, the message wrapped to the panel and the buttons the
+ * type asks for. Attached last to the control stack, so it draws on top and takes every
+ * click while it is up - the same in-app route the pop-up menu and the text entry take. */
+class LinuxMessageBoxControl final : public IControl
+{
+public:
+  LinuxMessageBoxControl() : IControl(IRECT()) { Hide(true); }
+
+  bool IsShown() const { return !IsHidden(); }
+
+  void Show(const char* caption, const char* message, EMsgBoxType type,
+            IMsgBoxCompletionHandlerFunc handler, const IRECT& canvas)
+  {
+    mCaption = caption ? caption : "";
+    mMessage = message ? message : "";
+    mType = type;
+    mHandler = std::move(handler);
+    mLines.clear();
+    mLineRects.clear();
+    mButtons.clear();
+    mRECT = canvas;
+    mTargetRECT = canvas;
+    Hide(false);
+  }
+
+  void Dismiss(EMsgBoxResult result)
+  {
+    const auto handler = std::move(mHandler);
+    mHandler = nullptr;
+    Hide(true); // marks the area dirty, so the frame after this one repaints without the box
+    mButtons.clear(); // the rects die with the box: a reader must not see the previous answer's buttons
+
+    if (handler)
+      handler(result);
+  }
+
+  void Draw(IGraphics& g) override
+  {
+    if (IsHidden())
+      return; // a dismissed box must not re-layout itself: iPlug 2 still draws control 0 while hidden
+
+    const IRECT canvas = g.GetBounds();
+
+    if (canvas != mRECT) // the window was resized while the box was up
+    {
+      mRECT = canvas;
+      mTargetRECT = canvas;
+      mLines.clear();
+      mLineRects.clear();
+      mButtons.clear();
+    }
+
+    if (mButtons.empty())
+      Layout(g);
+
+    g.FillRect(kOverlayColor, mRECT);
+
+    g.FillRoundRect(kPanelColor, mPanel, kPanelRadius);
+    g.DrawRoundRect(kBorderColor, mPanel, kPanelRadius);
+
+    if (!mCaption.empty())
+      g.DrawText(kTitleText, mCaption.c_str(), mTitleRect);
+
+    for (size_t i = 0; i < mLines.size() && i < mLineRects.size(); ++i)
+      g.DrawText(kBodyText, mLines[i].c_str(), mLineRects[i]);
+
+    for (const auto& b : mButtons)
+    {
+      g.FillRoundRect(b.rect.Contains(mMouseX, mMouseY) ? kButtonHoverColor : kButtonColor,
+                      b.rect, kButtonRadius);
+      g.DrawRoundRect(kBorderColor, b.rect, kButtonRadius);
+      g.DrawText(kButtonText, b.label, b.rect);
+    }
+  }
+
+  void OnMouseDown(float x, float y, const IMouseMod& mod) override
+  {
+    for (const auto& b : mButtons)
+    {
+      if (b.rect.Contains(x, y))
+      {
+        Dismiss(b.result);
+        return;
+      }
+    }
+  }
+
+  void OnMouseOver(float x, float y, const IMouseMod& mod) override
+  {
+    mMouseX = x;
+    mMouseY = y;
+    SetDirty(false);
+  }
+
+  void OnMouseOut() override { SetDirty(false); }
+
+  IRECT ButtonRect(int index) const
+  {
+    return (index >= 0 && index < static_cast<int>(mButtons.size())) ? mButtons[index].rect : IRECT();
+  }
+
+private:
+  struct MessageBoxButton
+  {
+    IRECT rect;
+    const char* label;
+    EMsgBoxResult result;
+  };
+
+  struct ButtonSpec
+  {
+    const char* label;
+    EMsgBoxResult result;
+  };
+
+  static std::vector<ButtonSpec> ButtonsFor(EMsgBoxType type)
+  {
+    switch (type)
+    {
+      case kMB_OKCANCEL: return { { "OK", kOK }, { "Cancel", kCANCEL } };
+      case kMB_YESNO: return { { "Yes", kYES }, { "No", kNO } };
+      case kMB_YESNOCANCEL: return { { "Yes", kYES }, { "No", kNO }, { "Cancel", kCANCEL } };
+      case kMB_RETRYCANCEL: return { { "Retry", kRETRY }, { "Cancel", kCANCEL } };
+      case kMB_OK: default: return { { "OK", kOK } };
+    }
+  }
+
+  void Layout(IGraphics& g)
+  {
+    mLines.clear();
+    mLineRects.clear();
+    mButtons.clear();
+
+    const float panelMaxW = std::min(mRECT.W() - 2 * kMargin, kPanelMaxWidth);
+    const float textMaxW = panelMaxW - 2 * kPadding;
+
+    WrapMessage(g, textMaxW);
+
+    float bodyMaxW = 0.f;
+
+    for (const auto& line : mLines)
+      bodyMaxW = std::max(bodyMaxW, TextWidth(g, kBodyText, line.c_str()));
+
+    const float titleW = TextWidth(g, kTitleText, mCaption.c_str());
+
+    const auto buttons = ButtonsFor(mType);
+    float buttonsW = -kButtonGap;
+
+    for (const auto& b : buttons)
+      buttonsW += std::max(TextWidth(g, kButtonText, b.label) + 2 * kButtonPadX, kButtonMinWidth) + kButtonGap;
+
+    const float contentW = std::max(std::max(titleW, bodyMaxW), buttonsW);
+    const float panelW = std::min(panelMaxW, std::max(contentW + 2 * kPadding, kPanelMinWidth));
+    const float panelH = kPadding + kTitleHeight + kTitleGap
+                       + static_cast<float>(mLines.size()) * kLineHeight + kBodyGap
+                       + kButtonHeight + kPadding;
+
+    mPanel = IRECT(mRECT.MW() - panelW / 2.f, mRECT.MH() - panelH / 2.f,
+                   mRECT.MW() + panelW / 2.f, mRECT.MH() + panelH / 2.f);
+
+    mTitleRect = IRECT(mPanel.L + kPadding, mPanel.T + kPadding,
+                       mPanel.R - kPadding, mPanel.T + kPadding + kTitleHeight);
+
+    float y = mTitleRect.B + kTitleGap;
+
+    for (const auto& line : mLines)
+    {
+      mLineRects.push_back(IRECT(mPanel.L + kPadding, y, mPanel.R - kPadding, y + kLineHeight));
+      y += kLineHeight;
+    }
+
+    // The row is centered in the panel, the way the macOS alert lays its buttons out: a
+    // single OK sits on the panel's vertical center line, which is also what makes the
+    // box clickable from a script without measuring the fonts twice. The floor keeps the
+    // buttons clickable even when no font is loaded and every measure comes back zero.
+    std::vector<float> widths;
+
+    for (const auto& b : buttons)
+      widths.push_back(std::max(TextWidth(g, kButtonText, b.label) + 2 * kButtonPadX, kButtonMinWidth));
+
+    float rowW = -kButtonGap;
+
+    for (float w : widths)
+      rowW += w + kButtonGap;
+
+    float x = mPanel.MW() - rowW / 2.f;
+
+    for (size_t i = 0; i < buttons.size(); ++i)
+    {
+      mButtons.push_back({ IRECT(x, mPanel.B - kPadding - kButtonHeight, x + widths[i], mPanel.B - kPadding),
+                           buttons[i].label, buttons[i].result });
+      x += widths[i] + kButtonGap;
+    }
+  }
+
+  /** With no font loaded, NanoVG measures out of an uninitialized bounds rect: NaN would
+   * poison every wrap comparison and the buttons end up nowhere. A measure that is not a
+   * number counts as zero, and the floors in Layout keep the box usable. */
+  float TextWidth(IGraphics& g, const IText& text, const char* str) const
+  {
+    IRECT measure;
+    const float w = g.MeasureText(text, str, measure);
+    return std::isfinite(w) ? w : 0.f;
+  }
+
+  void WrapMessage(IGraphics& g, float maxWidth)
+  {
+    std::size_t start = 0;
+
+    while (start <= mMessage.size())
+    {
+      const std::size_t nl = mMessage.find('\n', start);
+      const std::string paragraph = mMessage.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+
+      WrapParagraph(g, paragraph, maxWidth);
+
+      if (nl == std::string::npos)
+        break;
+
+      start = nl + 1;
+    }
+  }
+
+  void WrapParagraph(IGraphics& g, const std::string& paragraph, float maxWidth)
+  {
+    if (paragraph.empty())
+    {
+      mLines.push_back({});
+      return;
+    }
+
+    std::string line;
+    std::size_t start = 0;
+
+    while (start < paragraph.size())
+    {
+      const std::size_t end = paragraph.find(' ', start);
+      std::string word = paragraph.substr(start, end == std::string::npos ? std::string::npos : end - start);
+
+      if (!word.empty())
+      {
+        if (TextWidth(g, kBodyText, word.c_str()) > maxWidth)
+          word = BreakWord(g, word, maxWidth);
+
+        const std::string candidate = line.empty() ? word : line + " " + word;
+
+        if (TextWidth(g, kBodyText, candidate.c_str()) <= maxWidth || line.empty())
+          line = candidate;
+        else
+        {
+          mLines.push_back(line);
+          line = word;
+        }
+      }
+
+      start = (end == std::string::npos) ? paragraph.size() : end + 1;
+    }
+
+    if (!line.empty())
+      mLines.push_back(line);
+  }
+
+  std::string BreakWord(IGraphics& g, const std::string& word, float maxWidth)
+  {
+    std::string piece;
+
+    for (char c : word)
+    {
+      const std::string candidate = piece + c;
+
+      if (!piece.empty() && TextWidth(g, kBodyText, candidate.c_str()) > maxWidth)
+      {
+        mLines.push_back(piece);
+        piece = c;
+      }
+      else
+        piece = candidate;
+    }
+
+    return piece;
+  }
+
+  static constexpr float kMargin = 24.f;
+  static constexpr float kPadding = 20.f;
+  static constexpr float kPanelMaxWidth = 460.f;
+  static constexpr float kPanelMinWidth = 260.f;
+  static constexpr float kPanelRadius = 6.f;
+  static constexpr float kTitleHeight = 24.f;
+  static constexpr float kTitleGap = 12.f;
+  static constexpr float kLineHeight = 22.f;
+  static constexpr float kBodyGap = 16.f;
+  static constexpr float kButtonHeight = 30.f;
+  static constexpr float kButtonPadX = 14.f;
+  static constexpr float kButtonMinWidth = 64.f;
+  static constexpr float kButtonGap = 10.f;
+  static constexpr float kButtonRadius = 4.f;
+
+  const IColor kOverlayColor = IColor(110, 0, 0, 0);
+  const IColor kPanelColor = IColor(242, 250, 250, 250);
+  const IColor kBorderColor = IColor(255, 90, 90, 90);
+  const IColor kButtonColor = IColor(255, 228, 228, 228);
+  const IColor kButtonHoverColor = IColor(255, 205, 205, 205);
+
+  IText kTitleText = IText(17.f, COLOR_BLACK, nullptr, EAlign::Center, EVAlign::Middle);
+  IText kBodyText = IText(15.f, COLOR_BLACK, nullptr, EAlign::Center, EVAlign::Middle);
+  IText kButtonText = IText(14.f, COLOR_BLACK, nullptr, EAlign::Center, EVAlign::Middle);
+
+  std::string mCaption;
+  std::string mMessage;
+  EMsgBoxType mType = kMB_OK;
+  IMsgBoxCompletionHandlerFunc mHandler;
+  IRECT mPanel;
+  IRECT mTitleRect;
+  std::vector<std::string> mLines;
+  std::vector<IRECT> mLineRects;
+  std::vector<MessageBoxButton> mButtons;
+  float mMouseX = -1.f;
+  float mMouseY = -1.f;
+};
+
 EMsgBoxResult IGraphicsLinux::ShowMessageBox(const char* str, const char* caption, EMsgBoxType type,
                                              IMsgBoxCompletionHandlerFunc completionHandler)
 {
-  // TODO(linux): show a native (Qt/KDE) or in-app message box. Reporting a result keeps
-  // the plug-in's state machine moving instead of blocking on the missing dialog.
+  // The desktop's own message box does not exist: no portal offers one, and a Qt dialog
+  // is not worth a toolkit dependency inside a plug-in. What shows instead is the in-app
+  // box above, on the same thread as every other control (the window thread; a request
+  // from another thread is handed over through the queue the event pump drains).
+  if (WindowIsOpen())
+  {
+    auto show = [this, message = str ? std::string(str) : std::string(),
+                 title = caption ? std::string(caption) : std::string(), type, completionHandler]()
+    {
+      if (!mMessageBoxControl)
+      {
+        mMessageBoxControl = new LinuxMessageBoxControl();
+        AttachControl(mMessageBoxControl);
+      }
+
+      mMessageBoxControl->Show(title.c_str(), message.c_str(), type, completionHandler, GetBounds());
+    };
+
+    if (mUIThreadId == std::this_thread::get_id())
+      show();
+    else
+      PostToUIThread(std::move(show));
+
+    // The user's answer arrives through the completion handler, so there is no result to
+    // return yet - the value iPlug 2 documents for a box that cannot answer inline.
+    return kNoResult;
+  }
+
+  // No window to draw the box into (headless runner, build container): report and move on,
+  // which is what the probe documents in CI.
   DBGMSG("IGraphicsLinux::ShowMessageBox [%s] %s\n", caption ? caption : "", str ? str : "");
 
   const EMsgBoxResult result = (kMB_YESNO == type || kMB_YESNOCANCEL == type) ? kYES : kOK;
@@ -1363,6 +1715,17 @@ EMsgBoxResult IGraphicsLinux::ShowMessageBox(const char* str, const char* captio
     completionHandler(result);
 
   return result;
+}
+
+void IGraphicsLinux::HideMessageBox()
+{
+  if (mMessageBoxControl && mMessageBoxControl->IsShown())
+    mMessageBoxControl->Dismiss(kCANCEL);
+}
+
+IRECT IGraphicsLinux::GetMessageBoxButtonRect(int index) const
+{
+  return mMessageBoxControl ? mMessageBoxControl->ButtonRect(index) : IRECT();
 }
 
 #ifdef VOLUM_HAVE_PORTAL
