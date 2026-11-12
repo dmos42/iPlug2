@@ -462,7 +462,7 @@ struct IColor
     };
 
     IColor col;
-    h = std::fmodf(h, 1.0f);
+    h = std::fmod(h, 1.0f); // std::fmodf is missing from gcc 11's <cmath>
     if (h < 0.0f) h += 1.0f;
     s = Clip(s, 0.0f, 1.0f);
     l = Clip(l, 0.0f, 1.0f);
