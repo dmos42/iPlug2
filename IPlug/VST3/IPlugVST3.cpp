@@ -62,6 +62,16 @@ tresult PLUGIN_API IPlugVST3::terminate()
 {
   TRACE
 
+  // The idle timer is stopped in ~IPlugAPIBase, which runs LAST in the destruction
+  // chain: between the moment the derived destructor starts freeing the plug-in's
+  // state and that base stopping the thread, a tick can run OnIdle() against
+  // members that are already gone. On Linux the tick then executes on the timer
+  // thread itself (the editor's dispatcher is gone once the window closes), and the
+  // heap corruption it plants surfaces as an intermittent glibc abort at the host's
+  // final release. terminate() is the SDK's signal that the host is done with the
+  // instance, so the thread stops here, before any state is freed.
+  mTimer.reset();
+
   return SingleComponentEffect::terminate();
 }
 
