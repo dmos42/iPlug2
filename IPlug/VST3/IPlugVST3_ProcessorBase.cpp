@@ -104,6 +104,31 @@ void IPlugVST3ProcessorBase::ProcessMidiIn(IEventList* pEventList, IPlugQueue<IM
             processorQueue.Push(msg);
             break;
           }
+          case Event::kLegacyMIDICCOutEvent:
+          {
+            // A host that hands MIDI over as a byte stream - a standalone's port, a
+            // hardware bridge - sends everything that is not a note as this legacy
+            // event. Dropping it left the recall CC, the footswitches and program
+            // changes silently unanswered on those hosts.
+            const auto ctrlr = static_cast<ControllerNumbers>(event.midiCCOut.controlNumber);
+
+            if (ctrlr == ControllerNumbers::kCtrlProgramChange)
+              msg.MakeProgramChange(event.midiCCOut.value, event.midiCCOut.channel, event.sampleOffset);
+            else if (ctrlr == ControllerNumbers::kPitchBend)
+              msg.MakePitchWheelMsg((((event.midiCCOut.value2 << 7) | event.midiCCOut.value) - 8192) / 8192.,
+                                    event.midiCCOut.channel, event.sampleOffset);
+            else if (ctrlr == ControllerNumbers::kCtrlPolyPressure)
+              msg.MakePolyATMsg(event.midiCCOut.value, event.midiCCOut.value2, event.sampleOffset, event.midiCCOut.channel);
+            else if (ctrlr == ControllerNumbers::kAfterTouch)
+              msg.MakeChannelATMsg(event.midiCCOut.value, event.sampleOffset, event.midiCCOut.channel);
+            else
+              msg.MakeControlChangeMsg(static_cast<IMidiMsg::EControlChangeMsg>(event.midiCCOut.controlNumber),
+                                       event.midiCCOut.value / 127., event.midiCCOut.channel, event.sampleOffset);
+
+            ProcessMidiMsg(msg);
+            processorQueue.Push(msg);
+            break;
+          }
           case Event::kDataEvent:
           {
             ISysEx syx = ISysEx(event.sampleOffset, event.data.bytes, event.data.size);
