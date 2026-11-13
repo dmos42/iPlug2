@@ -1838,8 +1838,10 @@ EPortalResult askDesktop(PortalFileRequest& request, std::vector<std::string>& p
 void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path, EFileAction action, const char* ext,
                                    IFileDialogCompletionHandlerFunc completionHandler)
 {
-#ifdef VOLUM_HAVE_PORTAL
+  // Both branches name the action the same way: the no-portal branch logs it too.
   const bool save = action == EFileAction::Save;
+
+#ifdef VOLUM_HAVE_PORTAL
 
   PortalFileRequest request;
   request.mMethod = save ? "SaveFile" : "OpenFile";
