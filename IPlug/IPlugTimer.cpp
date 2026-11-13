@@ -155,12 +155,6 @@ namespace
 {
 std::mutex sDispatcherMutex;
 std::function<void(std::function<void()>)> sDispatcher;
-
-std::function<void(std::function<void()>)> GetThreadDispatcher()
-{
-  std::lock_guard<std::mutex> lock(sDispatcherMutex);
-  return sDispatcher;
-}
 } // namespace
 
 /** Held by shared_ptr so a tick that is already queued on the UI thread stays valid if
@@ -214,10 +208,14 @@ Timer_impl::Timer_impl(ITimerFunction func, uint32_t intervalMs)
           state->mFunc(*state->mTimer);
       };
 
-      const auto dispatch = GetThreadDispatcher();
+      // The dispatcher is called under its own mutex, so a platform layer that
+      // replaces it (an editor closing, IGraphicsLinux::RegisterTimerDispatcher)
+      // waits for the call in flight instead of leaving the timer thread holding
+      // a stale dispatcher whose captured editor was already destroyed.
+      std::lock_guard<std::mutex> lock(sDispatcherMutex);
 
-      if (dispatch)
-        dispatch(runTick);
+      if (sDispatcher)
+        sDispatcher(runTick);
       else
         runTick();
     }
